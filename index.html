@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>ALIfy</title>
+<style>
+  body { margin: 0; background: #222; color: #fff; font-family: sans-serif; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  #controls { padding: 15px; background: #333; display: flex; flex-direction: column; gap: 15px; z-index: 10; box-shadow: 0 2px 10px rgba(0,0,0,0.5); align-items: center; }
+  .row { display: flex; gap: 10px; justify-content: center; align-items: center; }
+  canvas { flex: 1; width: 100%; object-fit: contain; }
+  label { background: #555; padding: 10px 15px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; transition: background 0.2s; }
+  label:hover { background: #666; }
+  input[type="file"] { display: none; }
+  button { background: #007bff; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; font-weight: bold; font-size: 16px; transition: background 0.2s; }
+  button:hover { background: #0056b3; }
+  button:disabled { background: #444; cursor: not-allowed; }
+</style>
+</head>
+<body>
+<div id="controls">
+  <div class="row">
+    <label id="sourceLabel" for="sourceInput">Choose Source Image</label><input type="file" id="sourceInput" accept="image/*">
+    <button id="morphBtn">ALIfy!</button>
+  </div>
+  
+</div>
+<canvas id="canvas"></canvas>
+
+<script>
+
+const TARGET_BASE64 = './ali.jpg';
+
+
+function morton3D(r, g, b) {
+    let x = r, y = g, z = b;
+    x = (x | (x << 16)) & 0x030000ff;
+    x = (x | (x <<  8)) & 0x0300f00f;
+    x = (x | (x <<  4)) & 0x030c30c3;
+    x = (x | (x <<  2)) & 0x09249249;
+
+    y = (y | (y << 16)) & 0x030000ff;
+    y = (y | (y <<  8)) & 0x0300f00f;
+    y = (y | (y <<  4)) & 0x030c30c3;
+    y = (y | (y <<  2)) & 0x09249249;
+
+    z = (z | (z << 16)) & 0x030000ff;
+    z = (z | (z <<  8)) & 0x0300f00f;
+    z = (z | (z <<  4)) & 0x030c30c3;
+    z = (z | (z <<  2)) & 0x09249249;
+
+    return x | (y << 1) | (z << 2);
+}
+
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+let particles = [];
+let animFrame = null;
+let forward = true;
+let isAnimating = false;
+
+function loadImage(src) {
+    return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = reject;
+        img.src = src;
+    });
+}
+
+function getImageData(img, size) {
+    const tempCanvas = document.createElement('canvas');
+    tempCanvas.width = size;
+    tempCanvas.height = size;
+    const tempCtx = tempCanvas.getContext('2d');
+    
+    const minDim = Math.min(img.width, img.height);
+    const sx = (img.width - minDim) / 2;
+    const sy = (img.height - minDim) / 2;
+    
+    tempCtx.drawImage(img, sx, sy, minDim, minDim, 0, 0, size, size);
+    return tempCtx.getImageData(0, 0, size, size);
+}
+
+document.getElementById('sourceInput').addEventListener('change', (e) => {
+    const file = e.target.files[0];
+    if (file) {
+        document.getElementById('sourceLabel').textContent = "Source: " + file.name.substring(0, 15) + "...";
+        document.getElementById('morphBtn').disabled = false;
+    }
+});
+
+document.getElementById('morphBtn').addEventListener('click', async () => {
+    if (isAnimating) return;
+    const sourceFile = document.getElementById('sourceInput').files[0];
+    if (!sourceFile) return alert("Please select a source image!");
+    
+    document.getElementById('morphBtn').textContent = "Processing...";
+    document.getElementById('morphBtn').disabled = true;
+
+    await new Promise(requestAnimationFrame);
+    
+    try {
+        const size = 128;
+        const sImg = await loadImage(URL.createObjectURL(sourceFile));
+        const tImg = await loadImage(TARGET_BASE64);
+        
+        const sData = getImageData(sImg, size);
+        const tData = getImageData(tImg, size);
+        
+        const totalPixels = size * size;
+        const sPixels = new Array(totalPixels);
+        const tPixels = new Array(totalPixels);
+        
+        let ptr = 0;
+        for (let y = 0; y < size; y++) {
+            for (let x = 0; x < size; x++) {
+                const idx = (y * size + x) * 4;
+                sPixels[ptr] = {
+                    x, y,
+                    r: sData.data[idx],
+                    g: sData.data[idx + 1],
+                    b: sData.data[idx + 2],
+                    m: morton3D(sData.data[idx], sData.data[idx + 1], sData.data[idx + 2])
+                };
+                tPixels[ptr] = {
+                    x, y,
+                    r: tData.data[idx],
+                    g: tData.data[idx + 1],
+                    b: tData.data[idx + 2],
+                    m: morton3D(tData.data[idx], tData.data[idx + 1], tData.data[idx + 2])
+                };
+                ptr++;
+            }
+        }
+        
+        sPixels.sort((a, b) => a.m - b.m);
+        tPixels.sort((a, b) => a.m - b.m);
+        
+        particles = {
+            sx: new Float32Array(totalPixels),
+            sy: new Float32Array(totalPixels),
+            tx: new Float32Array(totalPixels),
+            ty: new Float32Array(totalPixels),
+            color: new Array(totalPixels)
+        };
+
+        for (let i = 0; i < totalPixels; i++) {
+            particles.sx[i] = sPixels[i].x;
+            particles.sy[i] = sPixels[i].y;
+            particles.tx[i] = tPixels[i].x;
+            particles.ty[i] = tPixels[i].y;
+            particles.color[i] = `rgb(${sPixels[i].r},${sPixels[i].g},${sPixels[i].b})`;
+        }
+        
+        if (animFrame) cancelAnimationFrame(animFrame);
+        
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight - document.getElementById('controls').clientHeight;
+        
+        const pSize = Math.min(canvas.width, canvas.height) / size;
+        const pDrawSize = Math.ceil(pSize);
+        const offsetX = (canvas.width - size * pSize) / 2;
+        const offsetY = (canvas.height - size * pSize) / 2;
+        
+        document.getElementById('morphBtn').textContent = "Morph!";
+        document.getElementById('morphBtn').disabled = false;
+
+        const duration = 1400;
+        let startTime = null;
+        forward = true;
+        isAnimating = true;
+        
+        function animate(timestamp) {
+            if (!startTime) startTime = timestamp;
+            const elapsed = timestamp - startTime;
+            let progress = Math.min(elapsed / duration, 1);
+            
+            // Cubic in-out easing
+            const t = progress < 0.5 
+                ? 4 * progress * progress * progress 
+                : 1 - Math.pow(-2 * progress + 2, 3) / 2;
+            
+            ctx.fillStyle = '#222';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            const sx = particles.sx;
+            const sy = particles.sy;
+            const tx = particles.tx;
+            const ty = particles.ty;
+            const colors = particles.color;
+            
+            for (let i = 0; i < totalPixels; i++) {
+                const cx = sx[i] + (tx[i] - sx[i]) * t;
+                const cy = sy[i] + (ty[i] - sy[i]) * t;
+                
+                ctx.fillStyle = colors[i];
+                ctx.fillRect(offsetX + cx * pSize, offsetY + cy * pSize, pDrawSize, pDrawSize);
+            }
+            
+            if (progress < 1) {
+                animFrame = requestAnimationFrame(animate);
+            } else {
+                isAnimating = false;
+                canvas.onclick = () => {
+                    if (isAnimating) return;
+                    for (let i = 0; i < totalPixels; i++) {
+                        const tempX = particles.sx[i], tempY = particles.sy[i];
+                        particles.sx[i] = particles.tx[i];
+                        particles.sy[i] = particles.ty[i];
+                        particles.tx[i] = tempX;
+                        particles.ty[i] = tempY;
+                    }
+                    startTime = null;
+                    forward = !forward;
+                    isAnimating = true;
+                    animFrame = requestAnimationFrame(animate);
+                };
+            }
+        }
+        
+        animFrame = requestAnimationFrame(animate);
+    } catch (e) {
+        console.error(e);
+        alert("Error: " + e.message + "\n" + e.stack);
+        document.getElementById('morphBtn').textContent = "ALIfy!!";
+        document.getElementById('morphBtn').disabled = false;
+    }
+});
+
+</script>
+</body>
+</html>
